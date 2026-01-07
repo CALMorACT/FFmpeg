@@ -1352,6 +1352,7 @@ static int ebml_parse(MatroskaDemuxContext *matroska,
 
     if (syntax->type != EBML_STOP) {
         matroska->current_id = 0;
+        // NOTE: update length for AVPacket parsing
         if ((res = ebml_read_length(matroska, pb, &length)) < 0)
             return res;
 
@@ -3462,7 +3463,7 @@ static int matroska_deliver_packet(MatroskaDemuxContext *matroska,
     if (matroska->queue.head) {
         MatroskaTrack *tracks = matroska->tracks.elem;
         MatroskaTrack *track;
-
+        // printf("deliver packet from queue\n");
         avpriv_packet_list_get(&matroska->queue, pkt);
         track = &tracks[pkt->stream_index];
         if (track->has_palette) {
@@ -3980,7 +3981,7 @@ static int matroska_parse_frame(MatroskaDemuxContext *matroska,
     uint8_t *pkt_data = data;
     int res = 0;
     AVPacket *pkt = matroska->pkt;
-
+    // printf("pkt_size=%d\n", pkt->size);
     if (st->codecpar->codec_id == AV_CODEC_ID_WAVPACK) {
         res = matroska_parse_wavpack(track, &pkt_data, &pkt_size);
         if (res < 0) {
@@ -4300,7 +4301,7 @@ static int matroska_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     MatroskaDemuxContext *matroska = s->priv_data;
     int ret = 0;
-
+    // av_log(matroska->ctx, AV_LOG_ERROR, "Here attack\n");
     if (matroska->resync_pos == -1) {
         // This can only happen if generic seeking has been used.
         matroska->resync_pos = avio_tell(s->pb);

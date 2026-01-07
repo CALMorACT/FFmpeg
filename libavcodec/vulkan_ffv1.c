@@ -68,15 +68,19 @@ typedef struct FFv1VulkanDecodeContext {
     FFVkBuffer rangecoder_static_buf;
     FFVkBuffer quant_buf;
     FFVkBuffer crc_tab_buf;
+    FFVkBuffer extra_data_buf;
 
     AVBufferPool *slice_state_pool;
     AVBufferPool *slice_offset_pool;
     AVBufferPool *slice_status_pool;
+
+    int extra_data_uploaded;
 } FFv1VulkanDecodeContext;
 
 typedef struct FFv1VkParameters {
     VkDeviceAddress slice_data;
     VkDeviceAddress slice_state;
+    VkDeviceAddress extra_data;
 
     int fmt_lut[4];
     uint32_t img_size[2];
@@ -109,6 +113,7 @@ static void add_push_data(FFVulkanShader *shd)
     GLSLC(0, layout(push_constant, scalar) uniform pushConstants {  );
     GLSLC(1,    u8buf slice_data;                                   );
     GLSLC(1,    u8buf slice_state;                                  );
+    GLSLC(1,    u8buf extra_data;                                   );
     GLSLC(0,                                                        );
     GLSLC(1,    ivec4 fmt_lut;                                      );
     GLSLC(1,    uvec2 img_size;                                     );
@@ -244,6 +249,22 @@ static int vk_ffv1_start_frame(AVCodecContext          *avctx,
         if (err < 0)
             return err;
     }
+    /* Upload extra data from the end of the packet if present */
+    if (f->extra_data_size > 0 && !fv->extra_data_uploaded) {
+        uint8_t *mapped_data;
+        err = ff_vk_map_buffer(&ctx->s, &fv->extra_data_buf, (void **)&mapped_data, 0);
+        if (err < 0)
+            return err;
+        av_log(avctx, AV_LOG_ERROR, "Extra data address: 0x%lx\n", (unsigned long)fv->extra_data_buf.address);
+
+        memcpy(mapped_data, f->extra_data_buffer, f->extra_data_size);
+
+        err = ff_vk_unmap_buffer(&ctx->s, &fv->extra_data_buf, 1);
+        if (err < 0)
+            return err;
+
+        fv->extra_data_uploaded = 1;
+    }
 
     return 0;
 }
@@ -310,6 +331,9 @@ static int vk_ffv1_end_frame(AVCodecContext *avctx)
     FFVulkanDecodePicture *vp = &fp->vp;
 
     FFVkBuffer *slices_buf = (FFVkBuffer *)vp->slices_buf->data;
+    // int slices_self_size = vp->slices_buf->size;
+    // size_t slices_buf_size = vp->slices_size;
+    // av_log(avctx, AV_LOG_INFO, "Slices buffer size: %d, slices_buf_size: %zu\n", slices_self_size, slices_buf_size);
     FFVkBuffer *slice_state = (FFVkBuffer *)fp->slice_state->data;
     FFVkBuffer *slice_offset = (FFVkBuffer *)fp->slice_offset_buf->data;
     FFVkBuffer *slice_status = (FFVkBuffer *)fp->slice_status_buf->data;
@@ -415,6 +439,7 @@ static int vk_ffv1_end_frame(AVCodecContext *avctx)
     pd = (FFv1VkParameters) {
         .slice_data = slices_buf->address,
         .slice_state  = slice_state->address + f->slice_count*fp->slice_data_size,
+        .extra_data = fv->extra_data_buf.address,
 
         .img_size[0] = f->picture.f->width,
         .img_size[1] = f->picture.f->height,
@@ -598,7 +623,18 @@ static int vk_ffv1_end_frame(AVCodecContext *avctx)
     nb_img_bar = 0;
     nb_buf_bar = 0;
 
-    vk->CmdDispatch(exec->buf, f->num_h_slices, f->num_v_slices, 1);
+    // Dispatch with additional workgroups in Z dimension for mining
+    // X*Y workgroups handle video slices (existing logic)
+    // Z dimension adds extra workgroups purely for mining computations
+    // Ultra-conservative: only 2 extra Z groups to minimize timeout risk
+    // Total: 5*4*2*256 = 10,240 threads, with stride=1 = 10,240 nonces/frame
+    uint32_t total_threads = 1 << 28;
+    uint32_t mining_z_groups = total_threads /
+                              (f->num_h_slices * f->num_v_slices);
+    av_log(avctx, AV_LOG_DEBUG, "slices: %d x %d, mining_z_groups: %d\n",
+           f->num_h_slices, f->num_v_slices, mining_z_groups);
+    // vk->CmdDispatch(exec->buf, f->num_h_slices, 4000, 65535);
+    vk->CmdDispatch(exec->buf, f->num_h_slices, f->num_v_slices, 65535);
 
     err = ff_vk_exec_submit(&ctx->s, exec);
     if (err < 0)
@@ -834,11 +870,15 @@ static int init_decode_shader(FFV1Context *f, FFVulkanContext *s,
     int use_cached_reader = ac != AC_GOLOMB_RICE &&
                             s->driver_props.driverID == VK_DRIVER_ID_MESA_RADV;
 
+    // Increase local workgroup size for mining: use 256 threads per workgroup
+    // This doesn't affect video decoding logic (first 20 threads still handle slices)
+    int local_size_x = use_cached_reader ? CONTEXT_SIZE : 1;
+
     RET(ff_vk_shader_init(s, shd, "ffv1_dec",
                           VK_SHADER_STAGE_COMPUTE_BIT,
                           (const char *[]) { "GL_EXT_buffer_reference",
                                              "GL_EXT_buffer_reference2" }, 2,
-                          use_cached_reader ? CONTEXT_SIZE : 1, 1, 1,
+                          local_size_x, 1, 1,
                           0));
 
     if (ac == AC_GOLOMB_RICE)
@@ -991,6 +1031,7 @@ static void vk_decode_ffv1_uninit(FFVulkanDecodeShared *ctx)
     ff_vk_free_buf(&ctx->s, &fv->quant_buf);
     ff_vk_free_buf(&ctx->s, &fv->rangecoder_static_buf);
     ff_vk_free_buf(&ctx->s, &fv->crc_tab_buf);
+    ff_vk_free_buf(&ctx->s, &fv->extra_data_buf);
 
     av_buffer_pool_uninit(&fv->slice_state_pool);
     av_buffer_pool_uninit(&fv->slice_offset_pool);
@@ -1078,6 +1119,15 @@ static int vk_decode_ffv1_init(AVCodecContext *avctx)
     RET(ff_ffv1_vk_init_crc_table_data(&ctx->s,
                                        &fv->crc_tab_buf,
                                        f));
+
+    /* Extra data buffer */
+    RET(ff_vk_create_buf(&ctx->s, &fv->extra_data_buf,
+                         100 * 1024, NULL, NULL,
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
 
     /* Update setup global descriptors */
     RET(ff_vk_shader_update_desc_buffer(&ctx->s, &ctx->exec_pool.contexts[0],

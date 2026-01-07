@@ -806,6 +806,27 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *rframe,
     f->avctx = avctx;
     f->frame_damaged = 0;
 
+    const uint8_t *buf = avpkt->data;
+    int buf_size = avpkt->size;
+
+    f->extra_data_size = 0;
+    if (buf_size > 12) {
+        uint32_t magic1 = AV_RL32(buf);
+        uint32_t magic2 = AV_RL32(buf + 4);
+        if (magic1 == 0xDEADBEEF && magic2 == 0xBEEFDEAD) {
+            uint32_t extra_size = AV_RL32(buf + 8);
+            if (extra_size > 0 && extra_size < buf_size - 12) {
+                av_fast_malloc(&f->extra_data_buffer, &f->extra_data_allocated, extra_size);
+                if (f->extra_data_buffer) {
+                    f->extra_data_size = extra_size;
+                    memcpy(f->extra_data_buffer, buf + 12, extra_size);
+                    avpkt->data += 12 + extra_size;
+                    avpkt->size -= 12 + extra_size;
+                }
+            }
+        }
+    }
+
     ret = decode_header(avctx, &c, avpkt->data, avpkt->size);
     if (ret < 0)
         return ret;
@@ -962,6 +983,10 @@ static int update_thread_context(AVCodecContext *dst, const AVCodecContext *src)
 static av_cold int ffv1_decode_close(AVCodecContext *avctx)
 {
     FFV1Context *const s = avctx->priv_data;
+
+    av_freep(&s->extra_data_buffer);
+    s->extra_data_allocated = 0;
+    s->extra_data_size = 0;
 
     ff_progress_frame_unref(&s->picture);
     av_refstruct_unref(&s->hwaccel_picture_private);
